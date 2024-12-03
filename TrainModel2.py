@@ -1,9 +1,11 @@
 import tensorflow as tf
+import numpy as np
 import os
 import time
 import json
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dense, Flatten, Dropout
+from sklearn.utils.class_weight import compute_class_weight
 
 # Force CPU usage
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -37,6 +39,9 @@ def create_dataset(base_dir, target_size=(224, 224), batch_size=32, split_ratio=
     
     print(f"Found classes: {class_names}")
     
+    # Add class distribution tracking
+    class_distribution = {class_name: 0 for class_name in class_names}
+    
     all_paths = []
     all_labels = []
     
@@ -51,15 +56,29 @@ def create_dataset(base_dir, target_size=(224, 224), batch_size=32, split_ratio=
                  if os.path.isfile(os.path.join(class_path, f)) and 
                  f.lower().endswith(valid_extensions)]
         
+        class_distribution[class_name] = len(images)
         print(f"Found {len(images)} images in {class_name}")
         
         for img_name in images:
             all_paths.append(os.path.join(class_path, img_name))
             all_labels.append(class_idx)
     
-    # Check if we found any images
-    if not all_paths:
-        raise ValueError("No images found!")
+    # Print class distribution
+    print("\nClass distribution:")
+    for class_name, count in class_distribution.items():
+        print(f"{class_name}: {count} images")
+    
+    # Calculate class weights
+    class_weights = compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(all_labels),
+        y=all_labels
+    )
+    class_weight_dict = dict(zip(range(len(class_names)), class_weights))
+    
+    print("\nComputed class weights:")
+    for class_idx, weight in class_weight_dict.items():
+        print(f"{class_names[class_idx]}: {weight:.2f}")
     
     # Convert to tensors and shuffle
     all_paths = tf.convert_to_tensor(all_paths)
@@ -114,7 +133,7 @@ def create_dataset(base_dir, target_size=(224, 224), batch_size=32, split_ratio=
     print(f"Validation samples: {len(val_paths)}")
     print(f"Test samples: {len(test_paths)}")
     
-    return train_dataset, val_dataset, test_dataset, num_classes
+    return train_dataset, val_dataset, test_dataset, num_classes, class_weight_dict, class_names
 
 def create_control_model(input_shape=(224, 224, 3), num_classes=None):
     model = Sequential([
@@ -218,98 +237,115 @@ def create_model_4(input_shape=(224, 224, 3), num_classes=None):
     ])
     return model
 
-try:
-    # Load and prepare data
-    data_dir = 'Data'  # Updated path to match your structure
-    print(f"\nStarting data loading from: {os.path.abspath(data_dir)}")
-    train_dataset, val_dataset, test_dataset, num_classes = create_dataset(data_dir)
+def main():
+    try:
+        # Load and prepare data
+        data_dir = 'Data'  # Updated path to match your structure
+        print(f"\nStarting data loading from: {os.path.abspath(data_dir)}")
+        train_dataset, val_dataset, test_dataset, num_classes, class_weights, class_names = create_dataset(data_dir)
 
-    # Define models to train
-    models = {
-        'control': create_control_model,
-        'model1': create_model_1,
-        'model2': create_model_2,
-        'model3': create_model_3,
-        'model4': create_model_4
-    }
+        # Define models to train
+        models = {
+            'control': create_control_model,
+            'model1': create_model_1,
+            'model2': create_model_2,
+            'model3': create_model_3,
+            'model4': create_model_4
+        }
 
-    # Results storage
-    results = {}
+        # Results storage
+        results = {}
 
-    # Train and evaluate each model
-    for model_name, model_fn in models.items():
-        print(f"\n=== Training {model_name} ===")
+        # Train and evaluate each model
+        for model_name, model_fn in models.items():
+            print(f"\n=== Training {model_name} ===")
+            
+            # Create and compile model
+            model = model_fn(num_classes=num_classes)
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+                loss='sparse_categorical_crossentropy',
+                metrics=['accuracy']
+            )
+
+            # Measure model size
+            model_size_mb = sum(tf.keras.backend.count_params(w) * 4 for w in model.weights) / (1024 * 1024)
+
+            # Measure training time
+            start_time = time.time()
+            history = model.fit(
+                train_dataset,
+                validation_data=val_dataset,
+                epochs=10,
+                class_weight=class_weights,  # Add class weights to training
+                verbose=1
+            )
+            training_time = time.time() - start_time
+
+            # Measure inference time
+            start_time = time.time()
+            test_loss, test_accuracy = model.evaluate(test_dataset)
+            inference_time = (time.time() - start_time) / len(test_dataset)
+
+            print(f"\n{model_name} test accuracy: {test_accuracy:.4f}")
+
+            # Generate confusion matrix
+            predictions = []
+            true_labels = []
+            for images, labels in test_dataset:
+                pred = model.predict(images, verbose=0)
+                pred_classes = np.argmax(pred, axis=1)
+                predictions.extend(pred_classes)
+                true_labels.extend(labels.numpy())
+
+            # Save results
+            results[model_name] = {
+                'history': history.history,
+                'test_accuracy': test_accuracy,
+                'test_loss': test_loss,
+                'training_time_hours': training_time / 3600,
+                'inference_time_ms': inference_time * 1000,
+                'model_size_mb': model_size_mb,
+                'class_weights': {str(k): float(v) for k, v in class_weights.items()},
+                'predictions': predictions,
+                'true_labels': true_labels
+            }
+
+            # Save the model
+            model.save(f'wildlife_classifier_{model_name}.h5')
+
+        # Print and save comparative results
+        print("\n=== Final Results ===")
+        comparison_results = {}
         
-        # Create and compile model
-        model = model_fn(num_classes=num_classes)
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-            loss='sparse_categorical_crossentropy',
-            metrics=['accuracy']
-        )
-
-        # Measure model size
-        model_size_mb = sum(tf.keras.backend.count_params(w) * 4 for w in model.weights) / (1024 * 1024)
-
-        # Measure training time
-        start_time = time.time()
-        history = model.fit(
-            train_dataset,
-            validation_data=val_dataset,
-            epochs=10,
-            verbose=1
-        )
-        training_time = time.time() - start_time
-
-        # Measure inference time
-        start_time = time.time()
-        test_loss, test_accuracy = model.evaluate(test_dataset)
-        inference_time = (time.time() - start_time) / len(test_dataset)
-
-        print(f"\n{model_name} test accuracy: {test_accuracy:.4f}")
+        for model_name, result in results.items():
+            print(f"{model_name}:")
+            print(f"  Test Accuracy: {result['test_accuracy']:.4f}")
+            print(f"  Best Validation Accuracy: {max(result['history']['val_accuracy']):.4f}")
+            print(f"  Training Time: {result['training_time_hours']:.2f}h")
+            print(f"  Inference Time: {result['inference_time_ms']:.2f}ms")
+            print(f"  Model Size: {result['model_size_mb']:.2f}MB")
+            print()
+            
+            comparison_results[model_name] = {
+                'test_accuracy': f"{result['test_accuracy']:.4f}",
+                'best_val_accuracy': f"{max(result['history']['val_accuracy']):.4f}",
+                'training_time_hours': f"{result['training_time_hours']:.2f}",
+                'inference_time_ms': f"{result['inference_time_ms']:.2f}",
+                'model_size_mb': f"{result['model_size_mb']:.2f}"
+            }
 
         # Save results
-        results[model_name] = {
-            'history': history.history,
-            'test_accuracy': test_accuracy,
-            'test_loss': test_loss,
-            'training_time_hours': training_time / 3600,
-            'inference_time_ms': inference_time * 1000,
-            'model_size_mb': model_size_mb
-        }
+        with open('model_results_detailed.json', 'w') as f:
+            json.dump(results, f, indent=4)
 
-        # Save the model
-        model.save(f'wildlife_classifier_{model_name}.h5')
+        with open('model_comparison.json', 'w') as f:
+            json.dump(comparison_results, f, indent=4)
 
-    # Print and save comparative results
-    print("\n=== Final Results ===")
-    comparison_results = {}
-    
-    for model_name, result in results.items():
-        print(f"{model_name}:")
-        print(f"  Test Accuracy: {result['test_accuracy']:.4f}")
-        print(f"  Best Validation Accuracy: {max(result['history']['val_accuracy']):.4f}")
-        print(f"  Training Time: {result['training_time_hours']:.2f}h")
-        print(f"  Inference Time: {result['inference_time_ms']:.2f}ms")
-        print(f"  Model Size: {result['model_size_mb']:.2f}MB")
-        print()
-        
-        comparison_results[model_name] = {
-            'test_accuracy': f"{result['test_accuracy']:.4f}",
-            'best_val_accuracy': f"{max(result['history']['val_accuracy']):.4f}",
-            'training_time_hours': f"{result['training_time_hours']:.2f}",
-            'inference_time_ms': f"{result['inference_time_ms']:.2f}",
-            'model_size_mb': f"{result['model_size_mb']:.2f}"
-        }
+    except Exception as e:
+        print(f"\nError encountered: {str(e)}")
+        print("\nCurrent working directory:", os.getcwd())
+        raise e
 
-    # Save results
-    with open('model_results_detailed.json', 'w') as f:
-        json.dump(results, f, indent=4)
-
-    with open('model_comparison.json', 'w') as f:
-        json.dump(comparison_results, f, indent=4)
-
-except Exception as e:
-    print(f"\nError encountered: {str(e)}")
-    print("\nCurrent working directory:", os.getcwd())
-    raise e
+if __name__ == "__main__":
+    main()
